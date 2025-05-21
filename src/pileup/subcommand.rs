@@ -31,7 +31,8 @@ use crate::util::{
     get_targets, get_ticker, parse_partition_tags, reader_is_bam, Region,
 };
 use crate::writers::{
-    BedGraphWriter, BedMethylWriter, PartitioningBedMethylWriter, PileupWriter,
+    BedGraphWriter, BedMethylOutputLine, BedMethylWriter,
+    PartitioningBedMethylWriter, PileupWriter,
 };
 
 #[derive(Args)]
@@ -711,6 +712,8 @@ impl ModBamPileup {
         let force_allow = self.force_allow_implicit;
         let max_depth = self.max_depth;
 
+        let mut all_output_lines: Vec<BedMethylOutputLine> = Vec::new();
+
         std::thread::spawn(move || {
             pool.install(|| {
                 for multi_chrom_coords in feeder.into_iter()
@@ -788,15 +791,57 @@ impl ModBamPileup {
                     processed_reads
                         .inc(mod_base_pileup.processed_records as u64);
                     skipped_reads.inc(mod_base_pileup.skipped_records as u64);
-                    let rows_written =
-                        writer.write(mod_base_pileup, &motif_labels)?;
-                    write_progress.inc(rows_written);
+                    // writer.write(mod_base_pileup, &motif_labels)?;
+                    if partition_tags.is_none() {
+                        for (pos, feature_counts_map) in mod_base_pileup.iter_counts_sorted() {
+                            if let Some(pileup_feature_counts_vec) = feature_counts_map.get(&crate::pileup::PartitionKey::NoKey) {
+                                for pfc in pileup_feature_counts_vec {
+                                    let name = if motif_labels.len() < 2 {
+                                        format!("{}", pfc.raw_mod_code)
+                                    } else {
+                                        pfc.motif_idx
+                                            .and_then(|i| motif_labels.get(i))
+                                            .map(|label| format!("{},{}", pfc.raw_mod_code, label))
+                                            .unwrap_or_else(|| format!("{}", pfc.raw_mod_code))
+                                    };
+                                    let output_line = BedMethylOutputLine {
+                                        chrom: mod_base_pileup.chrom_name.clone(),
+                                        pos: *pos,
+                                        name,
+                                        raw_strand: pfc.raw_strand,
+                                        filtered_coverage: pfc.filtered_coverage,
+                                        fraction_modified: pfc.fraction_modified,
+                                        n_modified: pfc.n_modified,
+                                        n_canonical: pfc.n_canonical,
+                                        n_other_modified: pfc.n_other_modified,
+                                        n_delete: pfc.n_delete,
+                                        n_filtered: pfc.n_filtered,
+                                        n_diff: pfc.n_diff,
+                                        n_nocall: pfc.n_nocall,
+                                    };
+                                    all_output_lines.push(output_line);
+                                    // write_progress.inc(1); // Removed: progress updated after sort/write
+                                }
+                            }
+                        }
+                    } else {
+                        // If partitioning is active, we use the existing writer directly.
+                        let rows_written = writer.write(mod_base_pileup, &motif_labels)?;
+                        write_progress.inc(rows_written);
+                    }
                 }
                 Err(message) => {
                     debug!("unexpected error {message}");
                 }
             }
         }
+
+        if partition_tags.is_none() {
+            all_output_lines.sort_unstable();
+            let rows_written_after_sort = writer.write_sorted_lines(all_output_lines)?;
+            write_progress.set_position(rows_written_after_sort);
+        }
+
         let rows_processed = write_progress.position();
         let n_skipped_reads = skipped_reads.position();
         let n_skipped_message = if n_skipped_reads == 0 {

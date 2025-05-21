@@ -32,6 +32,23 @@ use crate::pileup::{ModBasePileup, PartitionKey, PileupFeatureCounts};
 use crate::summarize::ModSummary;
 use crate::thresholds::Percentiles;
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BedMethylOutputLine {
+    pub chrom: String,
+    pub pos: u32,
+    pub name: String,
+    pub raw_strand: char,
+    pub filtered_coverage: u32,
+    pub fraction_modified: f32,
+    pub n_modified: u32,
+    pub n_canonical: u32,
+    pub n_other_modified: u32,
+    pub n_delete: u32,
+    pub n_filtered: u32,
+    pub n_diff: u32,
+    pub n_nocall: u32,
+}
+
 pub trait PileupWriter<T> {
     fn write(&mut self, item: T, motif_labels: &[String]) -> AnyhowResult<u64>;
 }
@@ -157,6 +174,130 @@ impl<T: Write + Sized> BedMethylWriter<T> {
         }
 
         Ok(rows_written)
+    }
+
+    pub fn write_sorted_lines(
+        &mut self,
+        lines: Vec<BedMethylOutputLine>,
+    ) -> AnyhowResult<u64> {
+        let tab = '\t';
+        let space = if self.tabs_and_spaces { ' ' } else { tab };
+        let mut rows_written = 0u64;
+
+        for line in lines {
+            let row_str = format!(
+                "{chrom}{tab}\
+                 {pos}{tab}\
+                 {pos_plus_1}{tab}\
+                 {name}{tab}\
+                 {score}{tab}\
+                 {strand}{tab}\
+                 {thick_start}{tab}\
+                 {thick_end}{tab}\
+                 {color}{tab}\
+                 {valid_coverage}{space}\
+                 {percent_modified}{space}\
+                 {n_modified}{space}\
+                 {n_canonical}{space}\
+                 {n_other_modified}{space}\
+                 {n_delete}{space}\
+                 {n_filtered}{space}\
+                 {n_diff}{space}\
+                 {n_nocall}\n",
+                chrom = line.chrom,
+                pos = line.pos,
+                pos_plus_1 = line.pos + 1,
+                name = line.name,
+                score = line.filtered_coverage, // Score is valid_coverage
+                strand = line.raw_strand,
+                thick_start = line.pos,
+                thick_end = line.pos + 1,
+                color = "255,0,0", // Standard color
+                valid_coverage = line.filtered_coverage,
+                percent_modified = format!("{:.2}", line.fraction_modified * 100.0),
+                n_modified = line.n_modified,
+                n_canonical = line.n_canonical,
+                n_other_modified = line.n_other_modified,
+                n_delete = line.n_delete,
+                n_filtered = line.n_filtered,
+                n_diff = line.n_diff,
+                n_nocall = line.n_nocall,
+            );
+            self.buf_writer
+                .write_all(row_str.as_bytes())
+                .with_context(|| "failed to write sorted bedmethyl row")?;
+            rows_written += 1;
+        }
+        Ok(rows_written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BedMethylOutputLine;
+
+    #[test]
+    fn test_bed_methyl_output_line_sorting() {
+        let mut lines = vec![
+            // Expected order: chr1:10, chr1:20, chr2:5 (name), chr2:5 (other_name)
+            BedMethylOutputLine {
+                chrom: "chr1".to_string(), pos: 20, name: "m,CG,0".to_string(), raw_strand: '+',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+            BedMethylOutputLine {
+                chrom: "chr2".to_string(), pos: 5, name: "other_name".to_string(), raw_strand: '+',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+            BedMethylOutputLine {
+                chrom: "chr1".to_string(), pos: 10, name: "m,CG,0".to_string(), raw_strand: '+',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+            BedMethylOutputLine {
+                chrom: "chr2".to_string(), pos: 5, name: "name".to_string(), raw_strand: '+',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+            // Test strand sorting
+            BedMethylOutputLine {
+                chrom: "chr3".to_string(), pos: 1, name: "m,CG,0".to_string(), raw_strand: '-',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+            BedMethylOutputLine {
+                chrom: "chr3".to_string(), pos: 1, name: "m,CG,0".to_string(), raw_strand: '+',
+                filtered_coverage: 10, fraction_modified: 0.5, n_modified: 5, n_canonical: 5,
+                n_other_modified: 0, n_delete: 0, n_filtered: 0, n_diff: 0, n_nocall: 0,
+            },
+        ];
+
+        lines.sort_unstable();
+
+        assert_eq!(lines[0].chrom, "chr1");
+        assert_eq!(lines[0].pos, 10);
+
+        assert_eq!(lines[1].chrom, "chr1");
+        assert_eq!(lines[1].pos, 20);
+
+        assert_eq!(lines[2].chrom, "chr2");
+        assert_eq!(lines[2].pos, 5);
+        assert_eq!(lines[2].name, "name"); // "name" before "other_name"
+
+        assert_eq!(lines[3].chrom, "chr2");
+        assert_eq!(lines[3].pos, 5);
+        assert_eq!(lines[3].name, "other_name");
+
+        assert_eq!(lines[4].chrom, "chr3");
+        assert_eq!(lines[4].pos, 1);
+        assert_eq!(lines[4].name, "m,CG,0");
+        assert_eq!(lines[4].raw_strand, '+'); // '+' before '-'
+
+        assert_eq!(lines[5].chrom, "chr3");
+        assert_eq!(lines[5].pos, 1);
+        assert_eq!(lines[5].name, "m,CG,0");
+        assert_eq!(lines[5].raw_strand, '-');
     }
 }
 
