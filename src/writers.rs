@@ -1184,10 +1184,81 @@ impl PartitioningBedMethylWriter {
             BufWriter::new(fh)
         })
     }
+
+    pub fn write_sorted_partitioned_lines(
+        &mut self,
+        sorted_partitions: HashMap<String, Vec<BedMethylOutputLine>>,
+    ) -> AnyhowResult<u64> {
+        let mut total_rows_written = 0u64;
+        let tab = '\t';
+        let space = if self.tabs_and_spaces { ' ' } else { tab };
+
+        // Sort by partition name to ensure deterministic output order of files
+        // (though file system might not guarantee listing order, this helps in testing)
+        let mut sorted_partition_keys: Vec<_> = sorted_partitions.keys().collect();
+        sorted_partition_keys.sort();
+
+        for partition_name_str in sorted_partition_keys {
+            if let Some(lines_vec) = sorted_partitions.get(partition_name_str) {
+                let writer = self.get_writer_for_key(partition_name_str);
+                // Consider writing bedmethyl header if files are new
+                // For now, assume header is not written by this method,
+                // or handled by get_writer_for_key if it's the first time.
+                // Current BedMethylWriter does not write header per partition,
+                // so this maintains consistency.
+
+                for line in lines_vec { // lines_vec is already sorted
+                    let row_str = format!(
+                        "{chrom}{tab}\
+                         {pos}{tab}\
+                         {pos_plus_1}{tab}\
+                         {name}{tab}\
+                         {score}{tab}\
+                         {strand}{tab}\
+                         {thick_start}{tab}\
+                         {thick_end}{tab}\
+                         {color}{tab}\
+                         {valid_coverage}{space}\
+                         {percent_modified}{space}\
+                         {n_modified}{space}\
+                         {n_canonical}{space}\
+                         {n_other_modified}{space}\
+                         {n_delete}{space}\
+                         {n_filtered}{space}\
+                         {n_diff}{space}\
+                         {n_nocall}\n",
+                        chrom = line.chrom,
+                        pos = line.pos,
+                        pos_plus_1 = line.pos + 1,
+                        name = line.name, // Name is already correctly formatted in BedMethylOutputLine
+                        score = line.filtered_coverage,
+                        strand = line.raw_strand,
+                        thick_start = line.pos,
+                        thick_end = line.pos + 1,
+                        color = "255,0,0",
+                        valid_coverage = line.filtered_coverage,
+                        percent_modified = format!("{:.2}", line.fraction_modified * 100.0),
+                        n_modified = line.n_modified,
+                        n_canonical = line.n_canonical,
+                        n_other_modified = line.n_other_modified,
+                        n_delete = line.n_delete,
+                        n_filtered = line.n_filtered,
+                        n_diff = line.n_diff,
+                        n_nocall = line.n_nocall,
+                    );
+                    writer
+                        .write_all(row_str.as_bytes())
+                        .with_context(|| format!("Failed to write sorted bedmethyl row for partition {}", partition_name_str))?;
+                    total_rows_written += 1;
+                }
+            }
+        }
+        Ok(total_rows_written)
+    }
 }
 
-const NOT_FOUND: &str = "not_found";
-const UNGROUPED: &str = "ungrouped";
+pub const NOT_FOUND: &str = "not_found";
+pub const UNGROUPED: &str = "ungrouped";
 
 impl PileupWriter<ModBasePileup> for PartitioningBedMethylWriter {
     fn write(

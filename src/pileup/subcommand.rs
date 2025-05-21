@@ -712,7 +712,9 @@ impl ModBamPileup {
         let force_allow = self.force_allow_implicit;
         let max_depth = self.max_depth;
 
+        // Declare both, use one based on partition_tags
         let mut all_output_lines: Vec<BedMethylOutputLine> = Vec::new();
+        let mut partitioned_output_lines: HashMap<String, Vec<BedMethylOutputLine>> = HashMap::new();
 
         std::thread::spawn(move || {
             pool.install(|| {
@@ -820,14 +822,49 @@ impl ModBamPileup {
                                         n_nocall: pfc.n_nocall,
                                     };
                                     all_output_lines.push(output_line);
-                                    // write_progress.inc(1); // Removed: progress updated after sort/write
                                 }
                             }
                         }
-                    } else {
-                        // If partitioning is active, we use the existing writer directly.
-                        let rows_written = writer.write(mod_base_pileup, &motif_labels)?;
-                        write_progress.inc(rows_written);
+                    } else { // partition_tags.is_some()
+                        for (pos, feature_counts_map) in mod_base_pileup.iter_counts_sorted() {
+                            for (partition_key_enum, pileup_feature_counts_vec) in feature_counts_map.iter() {
+                                let key_name_str = match partition_key_enum {
+                                    crate::pileup::PartitionKey::NoKey => crate::writers::UNGROUPED,
+                                    crate::pileup::PartitionKey::Key(idx) => mod_base_pileup
+                                        .partition_keys
+                                        .get_index(*idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or(crate::writers::NOT_FOUND),
+                                };
+                                for pfc in pileup_feature_counts_vec {
+                                    let name = if motif_labels.len() < 2 {
+                                        format!("{}", pfc.raw_mod_code)
+                                    } else {
+                                        pfc.motif_idx
+                                            .and_then(|i| motif_labels.get(i))
+                                            .map(|label| format!("{},{}", pfc.raw_mod_code, label))
+                                            .unwrap_or_else(|| format!("{}", pfc.raw_mod_code))
+                                    };
+                                    let output_line = BedMethylOutputLine {
+                                        chrom: mod_base_pileup.chrom_name.clone(),
+                                        pos: *pos,
+                                        name,
+                                        raw_strand: pfc.raw_strand,
+                                        filtered_coverage: pfc.filtered_coverage,
+                                        fraction_modified: pfc.fraction_modified,
+                                        n_modified: pfc.n_modified,
+                                        n_canonical: pfc.n_canonical,
+                                        n_other_modified: pfc.n_other_modified,
+                                        n_delete: pfc.n_delete,
+                                        n_filtered: pfc.n_filtered,
+                                        n_diff: pfc.n_diff,
+                                        n_nocall: pfc.n_nocall,
+                                    };
+                                    partitioned_output_lines.entry(key_name_str.to_string()).or_default().push(output_line);
+                                    // write_progress.inc is removed as progress will be set after all collection, sorting and writing
+                                }
+                            }
+                        }
                     }
                 }
                 Err(message) => {
@@ -840,6 +877,23 @@ impl ModBamPileup {
             all_output_lines.sort_unstable();
             let rows_written_after_sort = writer.write_sorted_lines(all_output_lines)?;
             write_progress.set_position(rows_written_after_sort);
+        } else {
+            // Sort lines within each partition
+            for (_partition_name, lines_vec) in partitioned_output_lines.iter_mut() {
+                lines_vec.sort_unstable();
+            }
+
+            // Re-construct PartitioningBedMethylWriter to call the specific method.
+            // This is a workaround for the type erasure of the 'writer' variable.
+            // A more thorough refactor would handle writer types more explicitly from the start.
+            // Note: This re-opens files. Header handling is consistent with current behavior (none for partitions).
+            let mut partitioning_writer_instance = PartitioningBedMethylWriter::new(
+                &self.out_bed, // out_bed is String, new expects &String
+                !self.mixed_delimiters, // only_tabs parameter
+                self.prefix.as_ref(),
+            )?;
+            let total_rows_written = partitioning_writer_instance.write_sorted_partitioned_lines(partitioned_output_lines)?;
+            write_progress.set_position(total_rows_written);
         }
 
         let rows_processed = write_progress.position();
